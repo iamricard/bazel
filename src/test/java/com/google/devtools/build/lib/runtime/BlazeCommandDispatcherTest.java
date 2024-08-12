@@ -14,26 +14,52 @@
 package com.google.devtools.build.lib.runtime;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 import static com.google.common.truth.extensions.proto.ProtoTruth.assertThat;
+import static com.google.devtools.build.lib.runtime.Command.BuildPhase.LOADS;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.util.Arrays.asList;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.common.testing.GcFinalization;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListeningExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.analysis.ServerDirectories;
+import com.google.devtools.build.lib.analysis.config.CoreOptions;
+import com.google.devtools.build.lib.authandtls.AuthAndTLSOptions;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.bugreport.BugReporter;
+import com.google.devtools.build.lib.buildeventservice.BazelBuildEventServiceModule;
+import com.google.devtools.build.lib.buildeventservice.BuildEventServiceOptions;
+import com.google.devtools.build.lib.buildeventservice.client.BuildEventServiceClient;
+import com.google.devtools.build.lib.buildeventservice.client.BuildEventServiceGrpcClient;
+import com.google.devtools.build.lib.buildeventstream.BuildEvent.LocalFile;
+import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader;
+import com.google.devtools.build.lib.buildeventstream.BuildEventIdUtil;
+import com.google.devtools.build.lib.buildeventstream.PathConverter;
+import com.google.devtools.build.lib.buildtool.BuildResult;
+import com.google.devtools.build.lib.buildtool.buildevent.BuildCompleteEvent;
+import com.google.devtools.build.lib.buildtool.buildevent.ProfilerStartedEvent;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventKind;
 import com.google.devtools.build.lib.events.Reporter;
+import com.google.devtools.build.lib.network.NoOpConnectivityModule;
 import com.google.devtools.build.lib.profiler.MemoryProfiler;
 import com.google.devtools.build.lib.profiler.Profiler;
+import com.google.devtools.build.lib.profiler.ProfilerTask;
+import com.google.devtools.build.lib.remote.Chunker;
+import com.google.devtools.build.lib.remote.util.DigestUtil;
+import com.google.devtools.build.lib.runtime.BuildEventArtifactUploaderFactory.InvalidPackagePathSymlinkException;
 import com.google.devtools.build.lib.runtime.CommandDispatcher.LockingMode;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.InvocationPolicy;
 import com.google.devtools.build.lib.server.FailureDetails;
@@ -42,6 +68,7 @@ import com.google.devtools.build.lib.server.FailureDetails.BuildProgress.Code;
 import com.google.devtools.build.lib.server.FailureDetails.Crash;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.Spawn;
+import com.google.devtools.build.lib.skyframe.SkyfocusOptions;
 import com.google.devtools.build.lib.testutil.MoreAsserts;
 import com.google.devtools.build.lib.testutil.Scratch;
 import com.google.devtools.build.lib.testutil.TestConstants;
@@ -50,22 +77,41 @@ import com.google.devtools.build.lib.testutil.TestUtils;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.ExitCode;
+import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.util.io.OutErr;
 import com.google.devtools.build.lib.util.io.RecordingOutErr;
+import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.XattrProvider;
+import com.google.devtools.build.v1.PublishBuildEventGrpc;
+import com.google.devtools.build.v1.PublishBuildToolEventStreamRequest;
+import com.google.devtools.build.v1.PublishBuildToolEventStreamResponse;
+import com.google.devtools.build.v1.PublishLifecycleEventRequest;
 import com.google.devtools.common.options.Option;
 import com.google.devtools.common.options.OptionDocumentationCategory;
 import com.google.devtools.common.options.OptionEffectTag;
 import com.google.devtools.common.options.OptionsBase;
 import com.google.devtools.common.options.OptionsParser;
 import com.google.devtools.common.options.OptionsParsingResult;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
+import io.grpc.inprocess.InProcessChannelBuilder;
+import io.grpc.inprocess.InProcessServerBuilder;
+import io.grpc.stub.StreamObserver;
+import io.grpc.util.MutableHandlerRegistry;
+import io.netty.util.AbstractReferenceCounted;
+import io.netty.util.ReferenceCounted;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.lang.ref.WeakReference;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.junit.After;
@@ -842,6 +888,293 @@ public final class BlazeCommandDispatcherTest {
     public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult options) {
       env.getEventBus().register(this);
       return resultSupplier.get();
+    }
+  }
+
+  @Test
+  public void testWaitingCommandDoesNotOverwriteAsyncUploadFiles() throws Exception {
+    var buildEventService = new NoOpBuildEventService();
+    var besWaitMax = Duration.ofSeconds(2);
+    var besServerName = "fake server for " + getClass();
+    var serviceRegistry = new MutableHandlerRegistry();
+    serviceRegistry.addService(buildEventService);
+    var besServer =
+        InProcessServerBuilder.forName(besServerName)
+            .fallbackHandlerRegistry(serviceRegistry)
+            .directExecutor()
+            .build()
+            .start();
+    var uploaderFactory = new TestUploaderFactory();
+    initializeRuntimeInternal(
+        new NoOpConnectivityModule(),
+        new TestBESandRemoteModule(besServerName, besWaitMax, uploaderFactory));
+    runtime.overrideCommands(ImmutableList.of(new TestBuildToolCommand()));
+    BlazeCommandDispatcher dispatch = new BlazeCommandDispatcher(runtime);
+    String[] firstBuildArgs = {
+      "fake_build",
+      "--generate_json_trace_profile=yes",
+      "--bes_backend=gprcs://inprocess",
+      // Commenting this out or changing it some other value makes this test pass
+      "--bes_upload_mode=fully_async",
+    };
+    dispatch.exec(Arrays.asList(firstBuildArgs), "test", outErr);
+    String[] secondBuildArgs = {
+      "fake_build", "--generate_json_trace_profile=yes", "--bes_backend=gprcs://inprocess",
+    };
+    dispatch.exec(Arrays.asList(secondBuildArgs), "test", outErr);
+
+    // Two profiles should have been submitted for upload
+    assertThat(uploaderFactory.uploads).hasSize(2);
+    var asyncUpload = uploaderFactory.uploads.get(0);
+    var secondUpload = uploaderFactory.uploads.get(1);
+    // Assert second upload first to validate it is correct
+    assertWithMessage("Second upload: " + secondUpload.invocationId)
+        .that(secondUpload.got)
+        .isEqualTo(secondUpload.wanted);
+    assertWithMessage("First upload (fully_async): " + asyncUpload.invocationId)
+        .that(asyncUpload.got)
+        .isEqualTo(asyncUpload.wanted);
+  }
+
+  private static class NoOpBuildEventService
+      extends PublishBuildEventGrpc.PublishBuildEventImplBase {
+    @Override
+    public StreamObserver<PublishBuildToolEventStreamRequest> publishBuildToolEventStream(
+        StreamObserver<PublishBuildToolEventStreamResponse> responseObserver) {
+      return new StreamObserver<PublishBuildToolEventStreamRequest>() {
+        @Override
+        public void onNext(PublishBuildToolEventStreamRequest request) {
+          responseObserver.onNext(
+              PublishBuildToolEventStreamResponse.newBuilder()
+                  .setStreamId(request.getOrderedBuildEvent().getStreamId())
+                  .setSequenceNumber(request.getOrderedBuildEvent().getSequenceNumber())
+                  .build());
+        }
+
+        @Override
+        public void onError(Throwable throwable) {
+          responseObserver.onError(throwable);
+        }
+
+        @Override
+        public void onCompleted() {
+          responseObserver.onCompleted();
+        }
+      };
+    }
+
+    @Override
+    public void publishLifecycleEvent(
+        PublishLifecycleEventRequest request, StreamObserver<Empty> responseObserver) {
+      responseObserver.onNext(Empty.newBuilder().build());
+      responseObserver.onCompleted();
+    }
+  }
+
+  private static class TestBESandRemoteModule extends BazelBuildEventServiceModule {
+    private final String besServerName;
+    private final Duration besMaxWait;
+    private final BuildEventArtifactUploaderFactory buildEventArtifactUploaderFactory;
+
+    private EventBus eventBus;
+    private ProfilerStartedEvent profilerStartedEvent;
+
+    private TestBESandRemoteModule(
+        String besServerName,
+        Duration besMaxWait,
+        BuildEventArtifactUploaderFactory buildEventArtifactUploaderFactory) {
+      this.besServerName = besServerName;
+      this.besMaxWait = besMaxWait;
+      this.buildEventArtifactUploaderFactory = buildEventArtifactUploaderFactory;
+    }
+
+    @Override
+    public void serverInit(OptionsParsingResult startupOptions, ServerBuilder builder) {
+      serverInitRemote(builder);
+    }
+
+    private void serverInitRemote(ServerBuilder builder) {
+      builder.addBuildEventArtifactUploaderFactory(buildEventArtifactUploaderFactory, "remote");
+    }
+
+    @Override
+    public void workspaceInit(
+        BlazeRuntime runtime, BlazeDirectories directories, WorkspaceBuilder builder) {}
+
+    @Override
+    public void beforeCommand(CommandEnvironment env) throws AbruptExitException {
+      beforeCommandBES(env);
+      beforeCommandRemote(env);
+    }
+
+    private void beforeCommandBES(CommandEnvironment env) throws AbruptExitException {
+      super.beforeCommand(env);
+    }
+
+    private void beforeCommandRemote(CommandEnvironment env) {
+      this.eventBus = env.getEventBus();
+      eventBus.register(this);
+    }
+
+    // <BES-overrides>
+    @Override
+    protected Set<String> allowedCommands(BuildEventServiceOptions besOptions) {
+      return Set.of("fake_build");
+    }
+
+    @Override
+    protected Duration getMaxWaitForPreviousInvocation() {
+      return Duration.ofSeconds(2);
+    }
+
+    @Override
+    protected BuildEventServiceClient getBesClient(
+        CommandEnvironment env,
+        BuildEventServiceOptions besOptions,
+        AuthAndTLSOptions authAndTLSOptions)
+        throws IOException {
+      return new BuildEventServiceGrpcClient(
+          InProcessChannelBuilder.forName(besServerName).build(),
+          null,
+          null,
+          env.getBuildRequestId(),
+          env.getCommandId());
+    }
+
+    // </BES-overrides>
+
+    // <Event-subscribers>
+    @Subscribe
+    public void profileStarting(ProfilerStartedEvent event) {
+      this.profilerStartedEvent = event;
+    }
+
+    @Subscribe
+    public void buildComplete(BuildCompleteEvent event) {
+      try {
+        Profiler.instance().stop();
+        event
+            .getResult()
+            .getBuildToolLogCollection()
+            .addLocalFile(profilerStartedEvent.getName(), profilerStartedEvent.getProfilePath());
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+    // </Event-subscribers>
+  }
+
+  private static final class TestUploaderFactory implements BuildEventArtifactUploaderFactory {
+    private static final record Upload(String invocationId, ByteString got, ByteString wanted) {}
+
+    private static final PathConverter pathConverter =
+        (Path path) -> String.format("bytestream://%s", path.getPathString());
+    private final ListeningExecutorService service =
+        MoreExecutors.listeningDecorator(Executors.newSingleThreadExecutor());
+
+    final List<Upload> uploads = new CopyOnWriteArrayList<>();
+
+    @Override
+    public BuildEventArtifactUploader create(CommandEnvironment env)
+        throws InvalidPackagePathSymlinkException {
+      return new TestUploader(env);
+    }
+
+    private final class TestUploader extends AbstractReferenceCounted
+        implements BuildEventArtifactUploader {
+      private final XattrProvider xattrProvider;
+      private final String buildRequestId;
+
+      private TestUploader(CommandEnvironment env) {
+        xattrProvider = env.getXattrProvider();
+        buildRequestId = env.getBuildRequestId();
+      }
+
+      @Override
+      public ListenableFuture<PathConverter> upload(Map<Path, LocalFile> files) {
+        Path maybeProfile = null;
+        for (var entry : files.entrySet()) {
+          if (entry.getKey().getPathString().equals("/output_base/command.profile.gz")) {
+            maybeProfile = entry.getKey();
+          }
+        }
+        if (maybeProfile == null) {
+          return Futures.immediateFuture(pathConverter);
+        }
+        var profile = maybeProfile;
+        return service.submit(
+            () -> {
+              var digestUtil =
+                  new DigestUtil(xattrProvider, profile.getFileSystem().getDigestFunction());
+              ByteString shouldHaveUploaded;
+              try (var in = profile.getInputStream()) {
+                shouldHaveUploaded = ByteString.copyFrom(in.readAllBytes());
+              }
+              var digest = digestUtil.compute(profile);
+              var chunker =
+                  Chunker.builder()
+                      .setInput(digest.getSizeBytes(), profile)
+                      .setChunkSize(1)
+                      .build();
+              // Give bazel time to start the next command
+              Thread.sleep(Duration.ofSeconds(1).toMillis());
+              Chunker.Chunk chunk;
+              ByteString actuallyUploaded = ByteString.empty();
+              while (chunker.hasNext()) {
+                chunk = chunker.next();
+                actuallyUploaded = actuallyUploaded.concat(chunk.getData());
+              }
+              uploads.add(new Upload(buildRequestId, actuallyUploaded, shouldHaveUploaded));
+              return pathConverter;
+            });
+      }
+
+      @Override
+      public boolean mayBeSlow() {
+        return true;
+      }
+
+      @Override
+      protected void deallocate() {}
+
+      @Override
+      public ReferenceCounted touch(Object o) {
+        return this;
+      }
+    }
+  }
+
+  @Command(
+      name = "fake_build",
+      shortDescription = "",
+      help = "",
+      buildPhase = LOADS,
+      options = {CoreOptions.class, SkyfocusOptions.class})
+  private static final class TestBuildToolCommand implements BlazeCommand {
+
+    @Override
+    public BlazeCommandResult exec(CommandEnvironment env, OptionsParsingResult options) {
+      try {
+        Thread.sleep((long) (Math.random() * 1000));
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+      Profiler.instance().logSimpleTask((long) (Math.random() * 1000), ProfilerTask.ACTION, "foo");
+      var result = new BuildResult(0);
+      result.setStopTime(1);
+      result.setDetailedExitCode(DetailedExitCode.success());
+      var event =
+          new BuildCompleteEvent(
+              result,
+              ImmutableList.of(BuildEventIdUtil.buildToolLogs(), BuildEventIdUtil.buildMetrics()));
+      env.getEventBus().post(event);
+      env.getEventBus().post(result.getBuildToolLogCollection().freeze().toEvent());
+      try {
+        Thread.sleep((long) (Math.random() * 1000));
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+      return BlazeCommandResult.detailedExitCode(result.getDetailedExitCode());
     }
   }
 }
